@@ -1,214 +1,337 @@
 import streamlit as st
-from google.cloud import firestore
-from google.oauth2 import service_account
-from datetime import datetime
-import json
+import firebase_admin
+from firebase_admin import credentials, firestore
+from datetime import datetime, timezone
+import pytz
 
-# ==========================================
-# 1. 初始化 Firebase Firestore
-# ==========================================
+# ── 頁面設定 ──────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="留言板",
+    page_icon="💬",
+    layout="centered",
+)
+
+# ── 自訂 CSS ──────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+/* 全域字體與背景 */
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Noto Sans TC', sans-serif;
+}
+
+/* 標題區 */
+.board-header {
+    text-align: center;
+    padding: 1.5rem 0 1rem;
+    border-bottom: 2px solid #e2e8f0;
+    margin-bottom: 1.5rem;
+}
+.board-header h1 {
+    font-size: 2rem;
+    font-weight: 700;
+    color: #1a202c;
+    margin: 0;
+}
+.board-header p {
+    color: #718096;
+    font-size: 0.9rem;
+    margin: 0.25rem 0 0;
+}
+
+/* 留言卡片 */
+.msg-card {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 1rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    transition: box-shadow 0.2s;
+}
+.msg-card:hover {
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+.msg-name {
+    font-weight: 700;
+    color: #2d3748;
+    font-size: 1rem;
+}
+.msg-content {
+    color: #4a5568;
+    margin: 0.4rem 0;
+    font-size: 0.95rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.msg-meta {
+    font-size: 0.75rem;
+    color: #a0aec0;
+}
+
+/* 表單區 */
+.form-section {
+    background: #f7fafc;
+    border-radius: 12px;
+    padding: 1.25rem;
+    border: 1px solid #e2e8f0;
+    margin-bottom: 1.5rem;
+}
+
+/* 管理員區 */
+.admin-section {
+    background: #fff8f0;
+    border: 1px solid #fbd38d;
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 1.5rem;
+}
+
+/* 成功 / 錯誤訊息 */
+.stAlert { border-radius: 8px; }
+</style>
+""", unsafe_allow_html=True)
+
+# ── Firebase 初始化 ───────────────────────────────────────────────────────────
 @st.cache_resource
-def init_firestore():
-    """使用 st.secrets 的 credentials 初始化 Firestore 實例"""
-    try:
-        # 將 secrets 中的 firebase 字典轉為與 Google 認證相符的格式
-        # 處理 private_key 中的換行符號
-        creds_dict = dict(st.secrets["firebase"])
-        creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
-        
-        credentials = service_account.Credentials.from_service_account_info(creds_dict)
-        db = firestore.Client(credentials=credentials, project=creds_dict["project_id"])
-        return db
-    except Exception as e:
-        st.error(f"Firebase 初始化失敗，請檢查 secrets.toml 設定。錯誤訊息: {e}")
-        return None
+def init_firebase():
+    """只初始化一次 Firebase，之後從快取取得。"""
+    if not firebase_admin._apps:
+        fb = st.secrets["firebase"]
+        cred = credentials.Certificate({
+            "type": fb["type"],
+            "project_id": fb["project_id"],
+            "private_key_id": fb["private_key_id"],
+            "private_key": fb["private_key"].replace("\\n", "\n"),
+            "client_email": fb["client_email"],
+            "client_id": fb["client_id"],
+            "auth_uri": fb["auth_uri"],
+            "token_uri": fb["token_uri"],
+            "auth_provider_x509_cert_url": fb["auth_provider_x509_cert_url"],
+            "client_x509_cert_url": fb["client_x509_cert_url"],
+        })
+        firebase_admin.initialize_app(cred)
+    return firestore.client()
 
-db = init_firestore()
-COLLECTION_NAME = "messages"
 
-# ==========================================
-# 2. 頁面基本設定與狀態初始化
-# ==========================================
-st.set_page_config(page_title="Streamlit 留言板", page_icon="💬", layout="centered")
-st.title("💬 雙向防詐防注水留言板")
+db = init_firebase()
+COLLECTION = "messages"
+TW = pytz.timezone("Asia/Taipei")
 
-# 用於儲存當前正在編輯或刪除的 Message ID 狀態
+# ── 輔助函式 ──────────────────────────────────────────────────────────────────
+def now_tw() -> datetime:
+    return datetime.now(tz=TW)
+
+
+def fmt_dt(ts) -> str:
+    """將 Firestore Timestamp 或 datetime 格式化為台灣時間字串。"""
+    if ts is None:
+        return "—"
+    if hasattr(ts, "tzinfo"):
+        dt = ts
+    else:
+        dt = ts.astimezone(TW)
+    if dt.tzinfo is None:
+        dt = TW.localize(dt)
+    else:
+        dt = dt.astimezone(TW)
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def fetch_messages():
+    """從 Firestore 取得所有留言，依 created_at 由新到舊排序。"""
+    docs = (
+        db.collection(COLLECTION)
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .stream()
+    )
+    return [{"id": d.id, **d.to_dict()} for d in docs]
+
+
+def add_message(name: str, content: str):
+    now = now_tw()
+    db.collection(COLLECTION).add({
+        "name": name.strip(),
+        "content": content.strip(),
+        "created_at": now,
+        "updated_at": now,
+    })
+
+
+def update_message(doc_id: str, content: str):
+    db.collection(COLLECTION).document(doc_id).update({
+        "content": content.strip(),
+        "updated_at": now_tw(),
+    })
+
+
+def delete_message(doc_id: str):
+    db.collection(COLLECTION).document(doc_id).delete()
+
+
+def check_admin(password: str) -> bool:
+    return password == st.secrets.get("admin_password", "")
+
+
+# ── Session State 初始化 ──────────────────────────────────────────────────────
+if "admin_verified" not in st.session_state:
+    st.session_state.admin_verified = False
 if "editing_id" not in st.session_state:
     st.session_state.editing_id = None
-if "deleting_id" not in st.session_state:
-    st.session_state.deleting_id = None
+if "edit_content" not in st.session_state:
+    st.session_state.edit_content = ""
 
-# ==========================================
-# 3. 功能函式庫 (CRUD 操作)
-# ==========================================
-def get_all_messages():
-    """取得所有留言，依 created_at 由新到舊排序"""
-    if db is None:
-        return []
-    try:
-        docs = db.collection(COLLECTION_NAME).order_by("created_at", direction=firestore.Query.DESCENDING).stream()
-        return [{"id": doc.id, **doc.to_dict()} for doc in docs]
-    except Exception as e:
-        st.error(f"讀取留言失敗: {e}")
-        return []
+# ── 頁面標題 ──────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="board-header">
+    <h1>💬 留言板</h1>
+    <p>歡迎留下你的想法，大家一起交流！</p>
+</div>
+""", unsafe_allow_html=True)
 
-def create_message(name, content):
-    """新增留言"""
-    if db is None: return
-    now = datetime.utcnow() # 建議使用 UTC 時間儲存，顯示時再處理或交由前端
-    try:
-        db.collection(COLLECTION_NAME).add({
-            "name": name,
-            "content": content,
-            "created_at": now,
-            "updated_at": now
-        })
-        st.success("留言成功！")
-        st.rerun()
-    except Exception as e:
-        st.error(f"新增留言失敗: {e}")
-
-def update_message(msg_id, new_content):
-    """更新留言內容"""
-    if db is None: return
-    try:
-        db.collection(COLLECTION_NAME).document(msg_id).update({
-            "content": new_content,
-            "updated_at": datetime.utcnow()
-        })
-        st.success("留言更新成功！")
-        st.session_state.editing_id = None # 清空編輯狀態
-        st.rerun()
-    except Exception as e:
-        st.error(f"更新留言失敗: {e}")
-
-def delete_message(msg_id):
-    """刪除指定留言"""
-    if db is None: return
-    try:
-        db.collection(COLLECTION_NAME).document(msg_id).delete()
-        st.success("留言已刪除！")
-        st.session_state.deleting_id = None # 清空刪除狀態
-        st.rerun()
-    except Exception as e:
-        st.error(f"刪除留言失敗: {e}")
-
-# ==========================================
-# 4. 管理者密碼驗證
-# ==========================================
-def verify_admin(password_input):
-    """驗證密碼是否與 secrets.toml 一致"""
-    return password_input == st.secrets.get("admin_password", "")
-
-# Sidebar 放管理員登入，方便全頁權限控管
-st.sidebar.header("🔐 管理員權限驗證")
-admin_password = st.sidebar.text_input("輸入管理者密碼", type="password", help="編輯與刪除留言需在此輸入正確密碼")
-
-# ==========================================
-# 5. UI 區塊：新增留言表單
-# ==========================================
-st.subheader("✍️ 發表新留言")
-with st.form("new_message_form", clear_on_submit=True):
-    input_name = st.text_input("暱稱 (最多 50 字)", max_chars=50).strip()
-    input_content = st.text_area("留言內容 (最多 500 字)", max_chars=500).strip()
-    submit_btn = st.form_submit_button("送出留言")
-    
-    if submit_btn:
-        # 後端邊界條件驗證
-        if not input_name:
-            st.error("❌ 暱稱不可為空！")
-        elif not input_content:
-            st.error("❌ 留言內容不可為空！")
-        else:
-            create_message(input_name, input_content)
-
-# ==========================================
-# 6. UI 區塊：動態彈出視窗 (編輯 / 刪除 互動區)
-# ==========================================
-# 處理編輯狀態 (當點擊某則留言的編輯，且密碼正確時觸發)
-if st.session_state.editing_id:
-    st.info("✏️ 正在編輯留言...")
-    # 取得舊資料回填
-    try:
-        target_doc = db.collection(COLLECTION_NAME).document(st.session_state.editing_id).get().to_dict()
-        if target_doc:
-            with st.container(border=True):
-                st.write(f"**原作者:** {target_doc.get('name')}")
-                edit_content = st.text_area("修改留言內容", value=target_doc.get("content"), max_chars=500)
-                col_eb1, col_eb2 = st.columns(2)
-                with col_eb1:
-                    if st.button("確認修改", type="primary"):
-                        if not edit_content.strip():
-                            st.error("❌ 修改後內容不可為空！")
-                        else:
-                            update_message(st.session_state.editing_id, edit_content.strip())
-                with col_eb2:
-                    if st.button("取消編輯"):
-                        st.session_state.editing_id = None
-                        st.rerun()
-    except Exception as e:
-        st.error(f"讀取待編輯資料失敗: {e}")
-
-# 處理刪除確認狀態
-if st.session_state.deleting_id:
-    st.warning("⚠️ 確定要刪除這條留言嗎？此操作無法復原。")
-    with st.container(border=True):
-        col_db1, col_db2 = st.columns(2)
-        with col_db1:
-            if st.button("💥 確定刪除", type="primary"):
-                delete_message(st.session_state.deleting_id)
-        with col_db2:
-            if st.button("保留留言"):
-                st.session_state.deleting_id = None
+# ── 管理員驗證區 ──────────────────────────────────────────────────────────────
+with st.expander("🔑 管理員登入（編輯 / 刪除留言需要）", expanded=False):
+    if st.session_state.admin_verified:
+        st.success("✅ 已以管理員身分登入")
+        if st.button("登出管理員"):
+            st.session_state.admin_verified = False
+            st.rerun()
+    else:
+        pwd_input = st.text_input("管理員密碼", type="password", key="pwd_input")
+        if st.button("驗證"):
+            if check_admin(pwd_input):
+                st.session_state.admin_verified = True
+                st.success("登入成功！")
                 st.rerun()
+            else:
+                st.error("密碼錯誤，請再試一次。")
 
 st.divider()
 
-# ==========================================
-# 7. UI 區塊：顯示留言列表
-# ==========================================
-st.subheader("📥 歷史留言列表")
-messages = get_all_messages()
+# ── 新增留言表單 ───────────────────────────────────────────────────────────────
+st.subheader("✏️ 新增留言")
+with st.container():
+    new_name = st.text_input(
+        "暱稱",
+        max_chars=50,
+        placeholder="你的暱稱（最多 50 字）",
+        key="new_name",
+    )
+    new_content = st.text_area(
+        "留言內容",
+        max_chars=500,
+        placeholder="寫下你想說的話…（最多 500 字）",
+        height=120,
+        key="new_content",
+    )
+    char_count = len(new_content)
+    st.caption(f"字數：{char_count} / 500")
+
+    if st.button("送出留言", type="primary", use_container_width=True):
+        name_val = new_name.strip()
+        content_val = new_content.strip()
+        errors = []
+        if not name_val:
+            errors.append("暱稱不可為空。")
+        elif len(name_val) > 50:
+            errors.append("暱稱最多 50 字。")
+        if not content_val:
+            errors.append("留言內容不可為空。")
+        elif len(content_val) > 500:
+            errors.append("留言內容最多 500 字。")
+
+        if errors:
+            for e in errors:
+                st.error(e)
+        else:
+            try:
+                add_message(name_val, content_val)
+                st.success("留言成功！")
+                st.rerun()
+            except Exception as ex:
+                st.error(f"儲存失敗：{ex}")
+
+st.divider()
+
+# ── 留言列表 ──────────────────────────────────────────────────────────────────
+st.subheader("📋 所有留言")
+
+try:
+    messages = fetch_messages()
+except Exception as ex:
+    st.error(f"讀取留言失敗：{ex}")
+    messages = []
 
 if not messages:
-    st.info("目前尚無任何留言，快來搶沙發！")
+    st.info("目前還沒有留言，成為第一個留言的人吧！")
 else:
     for msg in messages:
-        # 使用 st.container 包裹每則留言，不使用不安全 HTML，改用原生 markdown 防範 XSS
-        with st.container(border=True):
-            col_meta, col_actions = st.columns([3, 1])
-            
-            with col_meta:
-                st.markdown(f"### 👤 {msg['name']}")
-                # 轉為本地時間格式易讀
-                c_time = msg['created_at'].strftime('%Y-%m-%d %H:%M:%S') if msg.get('created_at') else "未知"
-                u_time = msg['updated_at'].strftime('%Y-%m-%d %H:%M:%S') if msg.get('updated_at') else "未知"
-                
-                if c_time == u_time:
-                    st.caption(f"🕒 發表於: {c_time}")
-                else:
-                    st.caption(f"🕒 發表於: {c_time} | ✏️ 修改於: {u_time}")
-            
-            with col_actions:
-                # 權限按鈕：點擊時先驗證側邊欄密碼
-                btn_edit = st.button("編輯", key=f"edit_{msg['id']}")
-                btn_delete = st.button("刪除", key=f"del_{msg['id']}")
-                
-                if btn_edit:
-                    if verify_admin(admin_password):
-                        st.session_state.editing_id = msg['id']
-                        st.session_state.deleting_id = None # 互斥
-                        st.rerun()
+        doc_id = msg["id"]
+        is_editing = st.session_state.editing_id == doc_id
+
+        with st.container():
+            st.markdown(f"""
+<div class="msg-card">
+    <div class="msg-name">👤 {msg.get('name', '匿名')}</div>
+    <div class="msg-content">{msg.get('content', '')}</div>
+    <div class="msg-meta">
+        🕐 建立：{fmt_dt(msg.get('created_at'))}
+        &nbsp;｜&nbsp;
+        🔄 更新：{fmt_dt(msg.get('updated_at'))}
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+            # 管理員操作按鈕
+            if st.session_state.admin_verified:
+                col_edit, col_del, _ = st.columns([1, 1, 4])
+                with col_edit:
+                    if not is_editing:
+                        if st.button("✏️ 編輯", key=f"edit_{doc_id}"):
+                            st.session_state.editing_id = doc_id
+                            st.session_state.edit_content = msg.get("content", "")
+                            st.rerun()
                     else:
-                        st.error("🔒 密碼錯誤或未輸入，無編輯權限")
-                        
-                if btn_delete:
-                    if verify_admin(admin_password):
-                        st.session_state.deleting_id = msg['id']
-                        st.session_state.editing_id = None # 互斥
-                        st.rerun()
-                    else:
-                        st.error("🔒 密碼錯誤或未輸入，無刪除權限")
-            
-            # 留言內文顯示
-            st.write(msg['content'])
+                        if st.button("取消", key=f"cancel_{doc_id}"):
+                            st.session_state.editing_id = None
+                            st.rerun()
+                with col_del:
+                    if st.button("🗑️ 刪除", key=f"del_{doc_id}"):
+                        try:
+                            delete_message(doc_id)
+                            st.success("留言已刪除。")
+                            st.rerun()
+                        except Exception as ex:
+                            st.error(f"刪除失敗：{ex}")
+
+            # 編輯表單（展開於該留言下方）
+            if is_editing:
+                with st.form(key=f"edit_form_{doc_id}"):
+                    edited = st.text_area(
+                        "修改留言內容",
+                        value=st.session_state.edit_content,
+                        max_chars=500,
+                        height=120,
+                        key=f"edit_ta_{doc_id}",
+                    )
+                    st.caption(f"字數：{len(edited)} / 500")
+                    submitted = st.form_submit_button("儲存修改", type="primary")
+                    if submitted:
+                        content_val = edited.strip()
+                        if not content_val:
+                            st.error("留言內容不可為空。")
+                        elif len(content_val) > 500:
+                            st.error("留言內容最多 500 字。")
+                        else:
+                            try:
+                                update_message(doc_id, content_val)
+                                st.session_state.editing_id = None
+                                st.success("留言已更新！")
+                                st.rerun()
+                            except Exception as ex:
+                                st.error(f"更新失敗：{ex}")
+
+# ── 頁尾 ──────────────────────────────────────────────────────────────────────
+st.divider()
+st.caption("Powered by Streamlit × Firebase Firestore")
