@@ -77,7 +77,7 @@ def init_firebase():
             if opt in fb:
                 cert[opt] = fb[opt]
 
-        db_url = st.secrets.get("firebase_db_url") or f"https://{fb['project_id']}-default-rtdb.firebaseio.com"
+        db_url = st.secrets["firebase_db_url"]
         firebase_admin.initialize_app(credentials.Certificate(cert), {"databaseURL": db_url})
 
     return db.reference("/")
