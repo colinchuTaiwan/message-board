@@ -1,12 +1,9 @@
 """
 firebase_service.py
 -------------------
-Firebase Firestore 資料存取模組。
+Firebase Realtime Database 資料存取模組。
+支援多個留言板，每個板有獨立的 DB 路徑。
 依賴：utils
-
-提供 Announcement 與 Message 的完整 CRUD 操作。
-所有 Firestore 操作均使用 try-except 包覆，
-並捕捉 FailedPrecondition（索引未建立）給出友善提示。
 """
 
 import logging
@@ -14,562 +11,415 @@ import math
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import firebase_admin
 import streamlit as st
-from google.api_core.exceptions import FailedPrecondition, GoogleAPIError
-from google.cloud import firestore
+from firebase_admin import credentials
+from firebase_admin import db as firebase_db
 
 from utils import get_client_ip_hash, sanitize_input
 
 logger = logging.getLogger(__name__)
 
-# ─── Firestore 集合名稱 ────────────────────────────────────────────────────────
-_COL_MESSAGES: str = "messages"
-_COL_ANNOUNCEMENTS: str = "announcements"
+# ─── 留言板設定 ────────────────────────────────────────────────────────────────
+
+BOARDS: list[dict] = [
+    {
+        "id":       "homeboard",
+        "name":     "🏠 可愛的家",
+        "db_path":  "homeboard",
+        "theme":    "warm",
+    },
+    # 如需新增留言板，在此加入新的 dict 即可，例如：
+    # {
+    #     "id":       "momboard",
+    #     "name":     "👩 媽媽的大小事",
+    #     "db_path":  "momboard",
+    #     "theme":    "rose",
+    # },
+]
+
+# id → board dict 查找表
+BOARD_MAP: dict[str, dict] = {b["id"]: b for b in BOARDS}
+
+
+def get_paths(board_id: str) -> tuple[str, str, str]:
+    """
+    回傳指定留言板的 (messages路徑, announcements路徑, visitors路徑)。
+
+    Args:
+        board_id: 留言板 ID
+
+    Returns:
+        (messages_path, announcements_path, visitors_path)
+    """
+    db_path = BOARD_MAP[board_id]["db_path"]
+    return (
+        f"{db_path}/messages",
+        f"{db_path}/announcements",
+        f"{db_path}/visitor_counts",
+    )
 
 
 # ─── Firebase 初始化 ───────────────────────────────────────────────────────────
 
 @st.cache_resource
-def get_db() -> firestore.Client | None:
+def init_firebase():
     """
-    初始化並回傳 Firestore Client。
-
-    使用 @st.cache_resource 確保全應用生命週期只初始化一次。
-    憑證來源：st.secrets["firebase"]（Service Account JSON 欄位）
-
-    Returns:
-        firestore.Client 實例；初始化失敗時回傳 None。
+    初始化 Firebase Admin SDK（Realtime Database）。
+    cache_resource 確保全生命週期只初始化一次。
     """
-    try:
-        import firebase_admin
-        from firebase_admin import credentials, firestore as fs
+    if firebase_admin._apps:
+        return firebase_admin.get_app()
 
-        # 避免重複初始化（Streamlit hot-reload 情境）
-        if not firebase_admin._apps:
-            secret = dict(st.secrets["firebase"])
-            cred = credentials.Certificate(secret)
-            firebase_admin.initialize_app(cred)
-
-        return fs.client()
-    except Exception as exc:
-        logger.exception("Firebase 初始化失敗：%s", exc)
-        st.error("⚠️ Firebase 初始化失敗，請確認 Streamlit Secrets 設定是否正確。")
-        return None
-
-
-# ─── 內部輔助函式 ──────────────────────────────────────────────────────────────
-
-def _handle_failed_precondition(exc: Exception, context: str = "") -> None:
-    """
-    統一處理 FailedPrecondition 例外（Composite Index 未建立）。
-
-    Args:
-        exc: 捕捉到的例外
-        context: 發生位置說明（用於 log）
-    """
-    msg = (
-        "⚠️ Firestore 複合索引尚未建立，請依 README 建立 Composite Index。\n"
-        f"詳細錯誤：{exc}"
+    s = st.secrets["firebase"]
+    cert_dict = {
+        "type":                        s["type"],
+        "project_id":                  s["project_id"],
+        "private_key_id":              s["private_key_id"],
+        "private_key":                 s["private_key"].replace("\\n", "\n"),
+        "client_email":                s["client_email"],
+        "client_id":                   s["client_id"],
+        "auth_uri":                    s["auth_uri"],
+        "token_uri":                   s["token_uri"],
+        "client_x509_cert_url":        s.get("client_x509_cert_url", ""),
+        "auth_provider_x509_cert_url": s.get("auth_provider_x509_cert_url", ""),
+    }
+    cred = credentials.Certificate(cert_dict)
+    return firebase_admin.initialize_app(
+        cred, {"databaseURL": s["database_url"]}
     )
-    st.error(msg)
-    logger.exception("FailedPrecondition [%s]：%s", context, exc)
 
 
-def _clamp_page(session_key: str, total_pages: int) -> None:
+def _get_db() -> Any:
+    """確保 Firebase 已初始化並回傳 db 模組。"""
+    init_firebase()
+    return firebase_db
+
+
+# ─── 訪客計數 ──────────────────────────────────────────────────────────────────
+
+def track_visitor(board_id: str) -> int:
     """
-    若目前頁碼超出總頁數，強制修正為最後一頁並觸發 rerun。
-
-    避免刪除最後一筆資料後出現空頁面報錯。
-    total_pages 為 0 時強制設為 1（空集合仍顯示第 1 頁）。
+    原子累加指定留言板的訪客人數。
+    同一 Session 每個板只計數一次。
 
     Args:
-        session_key: session_state 中儲存當前頁碼的 key
-        total_pages: 當前計算出的總頁數
-    """
-    safe_total = max(total_pages, 1)
-    current = st.session_state.get(session_key, 1)
-    if current > safe_total:
-        st.session_state[session_key] = safe_total
-        st.rerun()
-
-
-# ─── Message CRUD ──────────────────────────────────────────────────────────────
-
-def get_total_message_count(db: firestore.Client) -> int:
-    """
-    使用 Firestore Count API 取得可見留言總數。
-
-    使用 collection.count().get() 而非 len(list(query.stream()))，
-    避免讀取全部文件造成不必要的費用。
-    需要 firebase-admin >= 6.3.0。
-
-    Args:
-        db: Firestore Client
+        board_id: 留言板 ID
 
     Returns:
-        is_hidden == False 的留言總數；發生錯誤時回傳 0。
+        目前累計訪客數；失敗時回傳 0。
     """
+    counted_key = f"counted_{board_id}"
+    _, _, visitors_path = get_paths(board_id)
     try:
-        col_ref = db.collection(_COL_MESSAGES).where("is_hidden", "==", False)
-        result = col_ref.count().get()
-        return result[0][0].value
-    except FailedPrecondition as exc:
-        _handle_failed_precondition(exc, "get_total_message_count")
-        return 0
-    except GoogleAPIError as exc:
-        logger.exception("get_total_message_count GoogleAPIError：%s", exc)
-        st.error("讀取留言數失敗，請稍後再試 🐰")
-        return 0
+        db = _get_db()
+        ref = db.reference(f"{visitors_path}/main")
+
+        def increment(current):
+            return (current or 0) + 1
+
+        if not st.session_state.get(counted_key):
+            count = ref.transaction(increment)
+            st.session_state[counted_key] = True
+            return count or 0
+        else:
+            v = ref.get()
+            return v if v is not None else 0
     except Exception as exc:
-        logger.exception("get_total_message_count 未知錯誤：%s", exc)
-        st.error("讀取留言數失敗，請稍後再試 🐰")
+        logger.warning("track_visitor[%s] 失敗：%s", board_id, exc)
         return 0
 
 
-def get_messages_page(
-    db: firestore.Client,
+# ─── 留言 CRUD ─────────────────────────────────────────────────────────────────
+
+def get_total_message_count(board_id: str) -> int:
+    """取得指定留言板可見留言總數（is_hidden == False）。"""
+    try:
+        messages_path, _, _ = get_paths(board_id)
+        data = _get_db().reference(messages_path).get(shallow=False)
+        if not data:
+            return 0
+        return sum(
+            1 for v in data.values()
+            if isinstance(v, dict) and not v.get("is_hidden", False)
+        )
+    except Exception as exc:
+        logger.warning("get_total_message_count[%s] 失敗：%s", board_id, exc)
+        return 0
+
+
+def get_messages(
+    board_id: str,
     page_number: int,
     page_size: int = 50,
-) -> list[dict[str, Any]]:
+) -> list[dict]:
     """
-    取得前台指定頁面的留言（僅顯示 is_hidden == False）。
-
-    使用 offset() + limit() 分頁。
-    ⚠️ 注意：offset() 跳過的文件仍會計入 Firestore 讀取費用。
-
-    需要 Composite Index：
-        messages / is_hidden (ASC) / created_at (DESC)
+    取得指定留言板前台留言列表（is_hidden == False），依 created_at 降序。
 
     Args:
-        db: Firestore Client
+        board_id: 留言板 ID
         page_number: 頁碼（從 1 開始）
-        page_size: 每頁筆數，預設 50
+        page_size: 每頁筆數
 
     Returns:
-        dict 列表，每筆包含 id、name、content、created_at、is_hidden。
-        發生錯誤時回傳空列表。
+        dict 列表。
     """
     try:
-        offset_count = (page_number - 1) * page_size
-        query = (
-            db.collection(_COL_MESSAGES)
-            .where("is_hidden", "==", False)
-            .order_by("created_at", direction=firestore.Query.DESCENDING)
-            .offset(offset_count)
-            .limit(page_size)
-        )
-        docs = query.stream()
-        return [{"id": doc.id, **doc.to_dict()} for doc in docs]
-    except FailedPrecondition as exc:
-        _handle_failed_precondition(exc, "get_messages_page")
-        return []
-    except GoogleAPIError as exc:
-        logger.exception("get_messages_page GoogleAPIError：%s", exc)
-        st.error("讀取留言失敗，請稍後再試 🐰")
-        return []
+        messages_path, _, _ = get_paths(board_id)
+        data = _get_db().reference(messages_path).get()
+        if not data:
+            return []
+
+        messages = [
+            {"id": k, **v}
+            for k, v in data.items()
+            if isinstance(v, dict) and not v.get("is_hidden", False)
+        ]
+        messages.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        start = (page_number - 1) * page_size
+        return messages[start: start + page_size]
     except Exception as exc:
-        logger.exception("get_messages_page 未知錯誤：%s", exc)
-        st.error("讀取留言失敗，請稍後再試 🐰")
+        logger.exception("get_messages[%s] 失敗：%s", board_id, exc)
+        st.error("讀取留言失敗，請稍後再試")
         return []
 
 
-def get_admin_messages_page(
-    db: firestore.Client,
+def get_admin_messages(
+    board_id: str,
     page_number: int,
     page_size: int = 20,
-) -> tuple[list[dict[str, Any]], int]:
-    """
-    取得管理員後台指定頁面的留言（含隱藏留言）。
-
-    同時回傳總筆數供計算總頁數用。
-
-    Args:
-        db: Firestore Client
-        page_number: 頁碼（從 1 開始）
-        page_size: 每頁筆數，預設 20
-
-    Returns:
-        (留言列表, 總筆數) 的 tuple；發生錯誤時回傳 ([], 0)。
-    """
+) -> tuple[list[dict], int]:
+    """取得管理員後台指定留言板留言列表（含隱藏），依 created_at 降序。"""
     try:
-        # 取得總數（不含 is_hidden 篩選，管理員看全部）
-        total_count_result = db.collection(_COL_MESSAGES).count().get()
-        total_count: int = total_count_result[0][0].value
+        messages_path, _, _ = get_paths(board_id)
+        data = _get_db().reference(messages_path).get()
+        if not data:
+            return [], 0
 
-        offset_count = (page_number - 1) * page_size
-        query = (
-            db.collection(_COL_MESSAGES)
-            .order_by("created_at", direction=firestore.Query.DESCENDING)
-            .offset(offset_count)
-            .limit(page_size)
-        )
-        docs = query.stream()
-        messages = [{"id": doc.id, **doc.to_dict()} for doc in docs]
-        return messages, total_count
-    except FailedPrecondition as exc:
-        _handle_failed_precondition(exc, "get_admin_messages_page")
-        return [], 0
-    except GoogleAPIError as exc:
-        logger.exception("get_admin_messages_page GoogleAPIError：%s", exc)
-        st.error("讀取留言失敗，請稍後再試 🐰")
-        return [], 0
+        messages = [
+            {"id": k, **v}
+            for k, v in data.items()
+            if isinstance(v, dict)
+        ]
+        messages.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        total = len(messages)
+        start = (page_number - 1) * page_size
+        return messages[start: start + page_size], total
     except Exception as exc:
-        logger.exception("get_admin_messages_page 未知錯誤：%s", exc)
-        st.error("讀取留言失敗，請稍後再試 🐰")
+        logger.exception("get_admin_messages[%s] 失敗：%s", board_id, exc)
+        st.error("讀取留言失敗，請稍後再試")
         return [], 0
 
 
 def is_duplicate_message(
-    db: firestore.Client,
+    board_id: str,
     name: str,
     content: str,
     seconds: int = 60,
 ) -> bool:
-    """
-    檢查是否在指定秒數內有相同暱稱與相同內容的留言（防洗版）。
-
-    需要 Composite Index：
-        messages / name (ASC) / content (ASC) / created_at (ASC)
-
-    Args:
-        db: Firestore Client
-        name: 留言者暱稱
-        content: 留言內容
-        seconds: 檢查時間窗口（秒），預設 60
-
-    Returns:
-        True 表示存在重複留言，False 表示不重複或發生錯誤（保守放行）。
-    """
+    """檢查指定留言板 60 秒內是否有相同暱稱 + 相同內容的留言。"""
     try:
-        cutoff = datetime.now(tz=timezone.utc) - timedelta(seconds=seconds)
-        query = (
-            db.collection(_COL_MESSAGES)
-            .where("name", "==", name)
-            .where("content", "==", content)
-            .where("created_at", ">=", cutoff)
-            .limit(1)
-        )
-        docs = list(query.stream())
-        return len(docs) > 0
-    except FailedPrecondition as exc:
-        _handle_failed_precondition(exc, "is_duplicate_message")
+        messages_path, _, _ = get_paths(board_id)
+        data = _get_db().reference(messages_path).get()
+        if not data:
+            return False
+
+        cutoff = (
+            datetime.now(tz=timezone.utc) - timedelta(seconds=seconds)
+        ).isoformat()
+
+        for v in data.values():
+            if not isinstance(v, dict):
+                continue
+            if (
+                v.get("name") == name
+                and v.get("content") == content
+                and v.get("created_at", "") >= cutoff
+            ):
+                return True
         return False
     except Exception as exc:
-        logger.exception("is_duplicate_message 錯誤（保守放行）：%s", exc)
+        logger.warning("is_duplicate_message[%s] 失敗（保守放行）：%s", board_id, exc)
         return False
 
 
-def create_message(
-    db: firestore.Client,
-    name: str,
-    content: str,
-) -> bool:
+def create_message(board_id: str, name: str, content: str) -> bool:
     """
-    建立新留言。
-
-    會先呼叫 sanitize_input() 清理輸入，並記錄 IP hash。
+    新增留言至指定留言板。
 
     Args:
-        db: Firestore Client
-        name: 留言者暱稱（已驗證非空）
-        content: 留言內容（已驗證非空）
+        board_id: 留言板 ID
+        name: 暱稱
+        content: 留言內容
 
     Returns:
-        True 表示建立成功，False 表示失敗。
+        True 表示成功。
     """
     try:
-        clean_name = sanitize_input(name)
-        clean_content = sanitize_input(content)
+        messages_path, _, _ = get_paths(board_id)
         ip_hash = get_client_ip_hash()
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=timezone.utc).isoformat()
 
-        db.collection(_COL_MESSAGES).add({
-            "name": clean_name,
-            "content": clean_content,
+        _get_db().reference(messages_path).push({
+            "name":       sanitize_input(name),
+            "content":    sanitize_input(content),
             "created_at": now,
             "updated_at": now,
-            "is_hidden": False,
-            "ip_hash": ip_hash,
+            "is_hidden":  False,
+            "ip_hash":    ip_hash,
         })
-        logger.info("新增留言成功，暱稱：%s", clean_name)
         return True
-    except GoogleAPIError as exc:
-        logger.exception("create_message GoogleAPIError：%s", exc)
-        st.error("留言送出失敗，請稍後再試 🐰")
-        return False
     except Exception as exc:
-        logger.exception("create_message 未知錯誤：%s", exc)
-        st.error("留言送出失敗，請稍後再試 🐰")
+        logger.exception("create_message[%s] 失敗：%s", board_id, exc)
+        st.error("留言送出失敗，請稍後再試")
         return False
 
 
-def hide_message(db: firestore.Client, message_id: str) -> bool:
-    """
-    將指定留言設為隱藏。
-
-    Args:
-        db: Firestore Client
-        message_id: 留言文件 ID
-
-    Returns:
-        True 表示成功，False 表示失敗。
-    """
-    return _update_message_field(db, message_id, {"is_hidden": True}, "hide_message")
+def hide_message(board_id: str, message_id: str) -> bool:
+    """隱藏指定留言板的指定留言。"""
+    return _update_message(board_id, message_id, {"is_hidden": True})
 
 
-def unhide_message(db: firestore.Client, message_id: str) -> bool:
-    """
-    將指定留言取消隱藏。
-
-    Args:
-        db: Firestore Client
-        message_id: 留言文件 ID
-
-    Returns:
-        True 表示成功，False 表示失敗。
-    """
-    return _update_message_field(db, message_id, {"is_hidden": False}, "unhide_message")
+def unhide_message(board_id: str, message_id: str) -> bool:
+    """取消隱藏指定留言板的指定留言。"""
+    return _update_message(board_id, message_id, {"is_hidden": False})
 
 
-def delete_message(db: firestore.Client, message_id: str) -> bool:
-    """
-    永久刪除指定留言。
-
-    Args:
-        db: Firestore Client
-        message_id: 留言文件 ID
-
-    Returns:
-        True 表示成功，False 表示失敗。
-    """
+def delete_message(board_id: str, message_id: str) -> bool:
+    """永久刪除指定留言板的指定留言。"""
     try:
-        db.collection(_COL_MESSAGES).document(message_id).delete()
-        logger.info("刪除留言：%s", message_id)
+        messages_path, _, _ = get_paths(board_id)
+        _get_db().reference(f"{messages_path}/{message_id}").delete()
         return True
-    except GoogleAPIError as exc:
-        logger.exception("delete_message GoogleAPIError：%s", exc)
-        st.error("刪除留言失敗，請稍後再試 🐰")
-        return False
     except Exception as exc:
-        logger.exception("delete_message 未知錯誤：%s", exc)
-        st.error("刪除留言失敗，請稍後再試 🐰")
+        logger.exception("delete_message[%s] 失敗：%s", board_id, exc)
+        st.error("刪除失敗，請稍後再試")
         return False
 
 
-def _update_message_field(
-    db: firestore.Client,
-    message_id: str,
-    fields: dict[str, Any],
-    context: str,
-) -> bool:
-    """
-    更新留言指定欄位（內部輔助函式）。
-
-    Args:
-        db: Firestore Client
-        message_id: 留言文件 ID
-        fields: 要更新的欄位字典
-        context: 呼叫來源說明（用於 log）
-
-    Returns:
-        True 表示成功，False 表示失敗。
-    """
+def _update_message(board_id: str, message_id: str, fields: dict) -> bool:
+    """更新留言欄位（內部輔助）。"""
     try:
-        fields["updated_at"] = datetime.now(tz=timezone.utc)
-        db.collection(_COL_MESSAGES).document(message_id).update(fields)
+        messages_path, _, _ = get_paths(board_id)
+        fields["updated_at"] = datetime.now(tz=timezone.utc).isoformat()
+        _get_db().reference(f"{messages_path}/{message_id}").update(fields)
         return True
-    except GoogleAPIError as exc:
-        logger.exception("%s GoogleAPIError：%s", context, exc)
-        st.error("操作失敗，請稍後再試 🐰")
-        return False
     except Exception as exc:
-        logger.exception("%s 未知錯誤：%s", context, exc)
-        st.error("操作失敗，請稍後再試 🐰")
+        logger.exception("_update_message[%s] 失敗：%s", board_id, exc)
+        st.error("操作失敗，請稍後再試")
         return False
 
 
-# ─── Announcement CRUD ─────────────────────────────────────────────────────────
+# ─── 公告 CRUD ─────────────────────────────────────────────────────────────────
 
-def get_active_announcements(db: firestore.Client) -> list[dict[str, Any]]:
-    """
-    取得所有啟用中的公告，依 sort_order 升序排列。
-
-    Args:
-        db: Firestore Client
-
-    Returns:
-        dict 列表；發生錯誤時回傳空列表。
-    """
+def get_announcements(board_id: str) -> list[dict]:
+    """取得指定留言板前台公告（is_active == True），依 sort_order 升序。"""
     try:
-        query = (
-            db.collection(_COL_ANNOUNCEMENTS)
-            .where("is_active", "==", True)
-            .order_by("sort_order")
-        )
-        docs = query.stream()
-        return [{"id": doc.id, **doc.to_dict()} for doc in docs]
-    except FailedPrecondition as exc:
-        _handle_failed_precondition(exc, "get_active_announcements")
-        return []
+        _, announcements_path, _ = get_paths(board_id)
+        data = _get_db().reference(announcements_path).get()
+        if not data:
+            return []
+        anns = [
+            {"id": k, **v}
+            for k, v in data.items()
+            if isinstance(v, dict) and v.get("is_active", False)
+        ]
+        anns.sort(key=lambda x: x.get("sort_order", 0))
+        return anns
     except Exception as exc:
-        logger.exception("get_active_announcements 錯誤：%s", exc)
-        st.error("讀取公告失敗，請稍後再試 🐰")
+        logger.exception("get_announcements[%s] 失敗：%s", board_id, exc)
+        st.error("讀取公告失敗，請稍後再試")
         return []
 
 
-def get_all_announcements(db: firestore.Client) -> list[dict[str, Any]]:
-    """
-    取得所有公告（含停用），供管理員後台使用。
-
-    Args:
-        db: Firestore Client
-
-    Returns:
-        dict 列表；發生錯誤時回傳空列表。
-    """
+def get_all_announcements(board_id: str) -> list[dict]:
+    """取得指定留言板所有公告（含停用），供管理員使用。"""
     try:
-        docs = (
-            db.collection(_COL_ANNOUNCEMENTS)
-            .order_by("sort_order")
-            .stream()
-        )
-        return [{"id": doc.id, **doc.to_dict()} for doc in docs]
+        _, announcements_path, _ = get_paths(board_id)
+        data = _get_db().reference(announcements_path).get()
+        if not data:
+            return []
+        anns = [{"id": k, **v} for k, v in data.items() if isinstance(v, dict)]
+        anns.sort(key=lambda x: x.get("sort_order", 0))
+        return anns
     except Exception as exc:
-        logger.exception("get_all_announcements 錯誤：%s", exc)
-        st.error("讀取公告列表失敗，請稍後再試 🐰")
+        logger.exception("get_all_announcements[%s] 失敗：%s", board_id, exc)
+        st.error("讀取公告列表失敗，請稍後再試")
         return []
 
 
 def create_announcement(
-    db: firestore.Client,
-    title: str,
-    content: str,
-    sort_order: int = 0,
+    board_id: str, title: str, content: str, sort_order: int = 0
 ) -> bool:
-    """
-    新增公告。
-
-    Args:
-        db: Firestore Client
-        title: 公告標題
-        content: 公告內容
-        sort_order: 排序值（數字越小越前面），預設 0
-
-    Returns:
-        True 表示成功，False 表示失敗。
-    """
+    """新增公告至指定留言板。"""
     try:
-        now = datetime.now(tz=timezone.utc)
-        db.collection(_COL_ANNOUNCEMENTS).add({
-            "title": sanitize_input(title),
-            "content": sanitize_input(content),
-            "is_active": True,
+        _, announcements_path, _ = get_paths(board_id)
+        now = datetime.now(tz=timezone.utc).isoformat()
+        _get_db().reference(announcements_path).push({
+            "title":      sanitize_input(title),
+            "content":    sanitize_input(content),
+            "is_active":  True,
             "sort_order": sort_order,
             "created_at": now,
             "updated_at": now,
         })
         return True
     except Exception as exc:
-        logger.exception("create_announcement 錯誤：%s", exc)
-        st.error("新增公告失敗，請稍後再試 🐰")
+        logger.exception("create_announcement[%s] 失敗：%s", board_id, exc)
+        st.error("新增公告失敗，請稍後再試")
         return False
 
 
 def update_announcement(
-    db: firestore.Client,
-    ann_id: str,
-    title: str,
-    content: str,
-    sort_order: int,
+    board_id: str, ann_id: str, title: str, content: str, sort_order: int
 ) -> bool:
-    """
-    更新公告內容與排序。
-
-    Args:
-        db: Firestore Client
-        ann_id: 公告文件 ID
-        title: 新標題
-        content: 新內容
-        sort_order: 新排序值
-
-    Returns:
-        True 表示成功，False 表示失敗。
-    """
+    """修改指定留言板的公告內容與排序。"""
     try:
-        db.collection(_COL_ANNOUNCEMENTS).document(ann_id).update({
-            "title": sanitize_input(title),
-            "content": sanitize_input(content),
+        _, announcements_path, _ = get_paths(board_id)
+        _get_db().reference(f"{announcements_path}/{ann_id}").update({
+            "title":      sanitize_input(title),
+            "content":    sanitize_input(content),
             "sort_order": sort_order,
-            "updated_at": datetime.now(tz=timezone.utc),
+            "updated_at": datetime.now(tz=timezone.utc).isoformat(),
         })
         return True
     except Exception as exc:
-        logger.exception("update_announcement 錯誤：%s", exc)
-        st.error("更新公告失敗，請稍後再試 🐰")
+        logger.exception("update_announcement[%s] 失敗：%s", board_id, exc)
+        st.error("更新公告失敗，請稍後再試")
         return False
 
 
-def delete_announcement(db: firestore.Client, ann_id: str) -> bool:
-    """
-    永久刪除公告。
-
-    Args:
-        db: Firestore Client
-        ann_id: 公告文件 ID
-
-    Returns:
-        True 表示成功，False 表示失敗。
-    """
+def delete_announcement(board_id: str, ann_id: str) -> bool:
+    """永久刪除指定留言板的公告。"""
     try:
-        db.collection(_COL_ANNOUNCEMENTS).document(ann_id).delete()
+        _, announcements_path, _ = get_paths(board_id)
+        _get_db().reference(f"{announcements_path}/{ann_id}").delete()
         return True
     except Exception as exc:
-        logger.exception("delete_announcement 錯誤：%s", exc)
-        st.error("刪除公告失敗，請稍後再試 🐰")
+        logger.exception("delete_announcement[%s] 失敗：%s", board_id, exc)
+        st.error("刪除公告失敗，請稍後再試")
         return False
 
 
-def toggle_announcement(
-    db: firestore.Client,
-    ann_id: str,
-    is_active: bool,
-) -> bool:
-    """
-    切換公告的啟用 / 停用狀態。
-
-    Args:
-        db: Firestore Client
-        ann_id: 公告文件 ID
-        is_active: True 為啟用，False 為停用
-
-    Returns:
-        True 表示成功，False 表示失敗。
-    """
+def toggle_announcement(board_id: str, ann_id: str, is_active: bool) -> bool:
+    """切換指定留言板的公告啟用狀態。"""
     try:
-        db.collection(_COL_ANNOUNCEMENTS).document(ann_id).update({
-            "is_active": is_active,
-            "updated_at": datetime.now(tz=timezone.utc),
+        _, announcements_path, _ = get_paths(board_id)
+        _get_db().reference(f"{announcements_path}/{ann_id}").update({
+            "is_active":  is_active,
+            "updated_at": datetime.now(tz=timezone.utc).isoformat(),
         })
         return True
     except Exception as exc:
-        logger.exception("toggle_announcement 錯誤：%s", exc)
-        st.error("切換公告狀態失敗，請稍後再試 🐰")
+        logger.exception("toggle_announcement[%s] 失敗：%s", board_id, exc)
+        st.error("切換公告狀態失敗，請稍後再試")
         return False
 
 
-# ─── 分頁輔助 ─────────────────────────────────────────────────────────────────
+# ─── 分頁輔助 ──────────────────────────────────────────────────────────────────
 
 def compute_total_pages(total_count: int, page_size: int) -> int:
-    """
-    計算總頁數，最少為 1。
-
-    Args:
-        total_count: 總筆數
-        page_size: 每頁筆數
-
-    Returns:
-        總頁數（至少為 1）
-    """
+    """計算總頁數，最少為 1。"""
     if page_size <= 0:
         return 1
     return max(math.ceil(total_count / page_size), 1)
@@ -577,10 +427,10 @@ def compute_total_pages(total_count: int, page_size: int) -> int:
 
 def clamp_page(session_key: str, total_pages: int) -> None:
     """
-    若目前頁碼超出總頁數，強制修正並觸發 rerun（公開介面）。
-
-    Args:
-        session_key: session_state 中儲存當前頁碼的 key
-        total_pages: 當前計算出的總頁數
+    若當前頁碼超出總頁數，強制修正並觸發 rerun。
+    防止刪除最後一筆後出現空頁面。
     """
-    _clamp_page(session_key, total_pages)
+    safe_total = max(total_pages, 1)
+    if st.session_state.get(session_key, 1) > safe_total:
+        st.session_state[session_key] = safe_total
+        st.rerun()
