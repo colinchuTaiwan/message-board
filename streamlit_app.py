@@ -77,7 +77,12 @@ def init_firebase():
             if opt in fb:
                 cert[opt] = fb[opt]
 
-        db_url = st.secrets["firebase_db_url"]
+        db_url = (st.secrets.get("firebase_db_url")
+                  or st.secrets["firebase"].get("database_url")
+                  or st.secrets["firebase"].get("databaseURL"))
+        if not db_url:
+            st.error("❌ 找不到 firebase_db_url，請在 secrets.toml 設定。")
+            st.stop()
         firebase_admin.initialize_app(credentials.Certificate(cert), {"databaseURL": db_url})
 
     return db.reference("/")
