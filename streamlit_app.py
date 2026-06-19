@@ -51,7 +51,6 @@ html, body, [class*="css"] { font-family: 'Noto Sans TC', sans-serif; }
 """, unsafe_allow_html=True)
 
 # ── Firebase 初始化 ────────────────────────────────────────────────────────────
-@st.cache_resource
 def init_firebase():
     if not firebase_admin._apps:
         if "firebase" not in st.secrets:
@@ -83,6 +82,8 @@ def init_firebase():
         if not db_url:
             st.error("❌ 找不到 firebase_db_url，請在 secrets.toml 設定。")
             st.stop()
+        # DEBUG：確認實際使用的 URL（確認正常後可刪除）
+        st.toast(f"DB URL: {db_url}", icon="🔗")
         firebase_admin.initialize_app(credentials.Certificate(cert), {"databaseURL": db_url})
 
     return db.reference("/")
