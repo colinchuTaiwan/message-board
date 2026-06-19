@@ -1,8 +1,8 @@
 import streamlit as st
 import firebase_admin
 from firebase_admin import credentials, firestore
-from datetime import datetime, timezone
-import pytz
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # ── 頁面設定 ──────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -117,7 +117,7 @@ def init_firebase():
 
 db = init_firebase()
 COLLECTION = "messages"
-TW = pytz.timezone("Asia/Taipei")
+TW = ZoneInfo("Asia/Taipei")
 
 # ── 輔助函式 ──────────────────────────────────────────────────────────────────
 def now_tw() -> datetime:
@@ -128,14 +128,13 @@ def fmt_dt(ts) -> str:
     """將 Firestore Timestamp 或 datetime 格式化為台灣時間字串。"""
     if ts is None:
         return "—"
-    if hasattr(ts, "tzinfo"):
-        dt = ts
-    else:
+    # Firestore Timestamp 物件有 .astimezone()
+    if hasattr(ts, "astimezone"):
         dt = ts.astimezone(TW)
-    if dt.tzinfo is None:
-        dt = TW.localize(dt)
+    elif isinstance(ts, datetime):
+        dt = ts.astimezone(TW) if ts.tzinfo else ts.replace(tzinfo=TW)
     else:
-        dt = dt.astimezone(TW)
+        return "—"
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
