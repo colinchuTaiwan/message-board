@@ -98,7 +98,22 @@ html, body, [class*="css"] {
 def init_firebase():
     """只初始化一次 Firebase，之後從快取取得。"""
     if not firebase_admin._apps:
+        if "firebase" not in st.secrets:
+            st.error("❌ 找不到 [firebase] 設定，請檢查 secrets.toml 或 Streamlit Cloud Secrets。")
+            st.stop()
+
         fb = st.secrets["firebase"]
+
+        required_keys = [
+            "type", "project_id", "private_key_id", "private_key",
+            "client_email", "client_id", "auth_uri", "token_uri",
+            "auth_provider_x509_cert_url", "client_x509_cert_url",
+        ]
+        missing = [k for k in required_keys if k not in fb]
+        if missing:
+            st.error(f"❌ [firebase] 區塊缺少欄位：{', '.join(missing)}")
+            st.stop()
+
         cred = credentials.Certificate({
             "type": fb["type"],
             "project_id": fb["project_id"],
