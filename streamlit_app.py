@@ -106,26 +106,27 @@ def init_firebase():
 
         required_keys = [
             "type", "project_id", "private_key_id", "private_key",
-            "client_email", "client_id", "auth_uri", "token_uri",
-            "auth_provider_x509_cert_url", "client_x509_cert_url",
+            "client_email", "client_id",
         ]
         missing = [k for k in required_keys if k not in fb]
         if missing:
             st.error(f"❌ [firebase] 區塊缺少欄位：{', '.join(missing)}")
             st.stop()
 
-        cred = credentials.Certificate({
+        # 組合憑證 dict，選填欄位只在存在時加入
+        cert_dict = {
             "type": fb["type"],
             "project_id": fb["project_id"],
             "private_key_id": fb["private_key_id"],
             "private_key": fb["private_key"].replace("\\n", "\n"),
             "client_email": fb["client_email"],
             "client_id": fb["client_id"],
-            "auth_uri": fb["auth_uri"],
-            "token_uri": fb["token_uri"],
-            "auth_provider_x509_cert_url": fb["auth_provider_x509_cert_url"],
-            "client_x509_cert_url": fb["client_x509_cert_url"],
-        })
+        }
+        for optional in ("auth_uri", "token_uri", "auth_provider_x509_cert_url", "client_x509_cert_url"):
+            if optional in fb:
+                cert_dict[optional] = fb[optional]
+
+        cred = credentials.Certificate(cert_dict)
         firebase_admin.initialize_app(cred)
     return firestore.client()
 
